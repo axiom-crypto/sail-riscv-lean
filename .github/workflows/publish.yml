@@ -1,0 +1,105 @@
+name: Publish generated provider
+
+on:
+  workflow_dispatch:
+    inputs:
+      sail_src_commit:
+        description: Full axiom-crypto/sail-riscv source commit SHA
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out provider main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Validate requested source pin
+        env:
+          SAIL_SRC_COMMIT: ${{ inputs.sail_src_commit }}
+        run: |
+          [[ "$SAIL_SRC_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          printf '%s\n' "$SAIL_SRC_COMMIT" > SAIL_SRC_COMMIT
+
+      - name: Fetch the requested Sail source
+        env:
+          SAIL_SRC_COMMIT: ${{ inputs.sail_src_commit }}
+        run: |
+          git clone --quiet --filter=blob:none --no-checkout \
+            https://github.com/axiom-crypto/sail-riscv.git \
+            "${RUNNER_TEMP}/sail-riscv"
+          # Accept only commits reachable from a branch or tag of the source
+          # repository. GitHub serves any commit in a repository's fork network
+          # by SHA, so an unreachable SHA could name a fork's commit, whose
+          # generator would otherwise run here.
+          git -C "${RUNNER_TEMP}/sail-riscv" rev-list --remotes --tags | grep -Fx "$SAIL_SRC_COMMIT" > /dev/null
+          git -C "${RUNNER_TEMP}/sail-riscv" checkout --quiet --detach "$SAIL_SRC_COMMIT"
+          test "$(git -C "${RUNNER_TEMP}/sail-riscv" rev-parse HEAD)" = "$SAIL_SRC_COMMIT"
+
+      - name: Set up OCaml 5.2.1 and cached opam switch
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.2.1
+          opam-repositories: |
+            default: https://github.com/ocaml/opam-repository.git#3c79a939b221caf909b254fdff9616f8c0266e4f
+
+      - name: Install Z3 4.8.12
+        env:
+          Z3_VERSION: "4.8.12"
+          Z3_ARCHIVE_SHA256: "648e8a7afb57445440ad711b733bd675e3888da2767c14ae5122582c924d8d52"
+        run: |
+          archive="z3-${Z3_VERSION}-x64-glibc-2.31"
+          curl --location --fail --silent --show-error \
+            "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${archive}.zip" \
+            --output "${RUNNER_TEMP}/z3.zip"
+          echo "${Z3_ARCHIVE_SHA256}  ${RUNNER_TEMP}/z3.zip" | sha256sum --check --strict
+          unzip -q "${RUNNER_TEMP}/z3.zip" -d "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/${archive}/bin" >> "$GITHUB_PATH"
+
+      - name: Install Sail 0.20.2
+        run: |
+          opam install --yes sail.0.20.2
+          eval "$(opam env)"
+          [[ "$(sail --version)" == "Sail 0.20.2 "* ]]
+          [[ "$(z3 --version)" == "Z3 version 4.8.12 "* ]]
+
+      - name: Generate provider update
+        run: |
+          eval "$(opam env)"
+          SAIL_SOURCE_DIR="${RUNNER_TEMP}/sail-riscv" \
+            ./generate-provider.sh \
+              "${RUNNER_TEMP}/provider" \
+              "${RUNNER_TEMP}/z3-memo/memo.db"
+          rm -rf Lean_RV32D
+          mv "${RUNNER_TEMP}/provider/Lean_RV32D" Lean_RV32D
+
+      - name: Open provider update pull request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: automation/provider-${{ inputs.sail_src_commit }}
+          delete-branch: true
+          commit-message: "build: publish Sail provider ${{ inputs.sail_src_commit }}"
+          title: "build: publish Sail provider ${{ inputs.sail_src_commit }}"
+          body: |
+            Regenerates `Lean_RV32D` from `axiom-crypto/sail-riscv@${{ inputs.sail_src_commit }}`.
+
+            Merge only after the independent provider attestation succeeds.
+
+      - name: Dispatch independent attestation from trusted main
+        if: ${{ steps.create-pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROVIDER_BRANCH: automation/provider-${{ inputs.sail_src_commit }}
+        run: gh workflow run attest.yml --ref main -f candidate_ref="$PROVIDER_BRANCH"

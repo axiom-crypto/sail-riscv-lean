@@ -1,0 +1,159 @@
+name: Attest generated provider
+
+on:
+  pull_request_target:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Provider branch or commit to attest (defaults to the dispatched ref)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: attest-provider-${{ inputs.candidate_ref || github.event.pull_request.head.sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-provider:
+    # pull_request_target runs with write access, so it attests only pull
+    # requests from branches of this repository. A maintainer attests a fork's
+    # pull request after review by dispatching this workflow with its head
+    # commit as candidate_ref.
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out trusted orchestration
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: orchestration
+          persist-credentials: false
+
+      - name: Check out provider candidate as data
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.candidate_ref || github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Record candidate and pending attestation
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          candidate_sha="$(git -C candidate rev-parse HEAD)"
+          echo "sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${candidate_sha}" \
+            -f state=pending \
+            -f context=attest \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f description='Provider regeneration is running'
+
+      - name: Fetch the pinned Sail source
+        run: |
+          sail_src_commit="$(tr -d '\r\n' < candidate/SAIL_SRC_COMMIT)"
+          [[ "$sail_src_commit" =~ ^[0-9a-f]{40}$ ]]
+          git clone --quiet --filter=blob:none --no-checkout \
+            https://github.com/axiom-crypto/sail-riscv.git \
+            "${RUNNER_TEMP}/sail-riscv"
+          # Accept only commits reachable from a branch or tag of the source
+          # repository. GitHub serves any commit in a repository's fork network
+          # by SHA, so an unreachable SHA could name a fork's commit, whose
+          # generator would otherwise run here.
+          git -C "${RUNNER_TEMP}/sail-riscv" rev-list --remotes --tags | grep -Fx "$sail_src_commit" > /dev/null
+          git -C "${RUNNER_TEMP}/sail-riscv" checkout --quiet --detach "$sail_src_commit"
+          test "$(git -C "${RUNNER_TEMP}/sail-riscv" rev-parse HEAD)" = "$sail_src_commit"
+
+      - name: Set up OCaml 5.2.1 and cached opam switch
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.2.1
+          opam-repositories: |
+            default: https://github.com/ocaml/opam-repository.git#3c79a939b221caf909b254fdff9616f8c0266e4f
+
+      - name: Install Z3 4.8.12
+        env:
+          Z3_VERSION: "4.8.12"
+          Z3_ARCHIVE_SHA256: "648e8a7afb57445440ad711b733bd675e3888da2767c14ae5122582c924d8d52"
+        run: |
+          archive="z3-${Z3_VERSION}-x64-glibc-2.31"
+          curl --location --fail --silent --show-error \
+            "https://github.com/Z3Prover/z3/releases/download/z3-${Z3_VERSION}/${archive}.zip" \
+            --output "${RUNNER_TEMP}/z3.zip"
+          echo "${Z3_ARCHIVE_SHA256}  ${RUNNER_TEMP}/z3.zip" | sha256sum --check --strict
+          unzip -q "${RUNNER_TEMP}/z3.zip" -d "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/${archive}/bin" >> "$GITHUB_PATH"
+
+      - name: Install Sail 0.20.2
+        run: |
+          opam install --yes sail.0.20.2
+          eval "$(opam env)"
+          [[ "$(sail --version)" == "Sail 0.20.2 "* ]]
+          [[ "$(z3 --version)" == "Z3 version 4.8.12 "* ]]
+
+      - name: Regenerate and compare
+        run: |
+          eval "$(opam env)"
+          SAIL_SRC_COMMIT_FILE="${GITHUB_WORKSPACE}/candidate/SAIL_SRC_COMMIT" \
+          SAIL_SOURCE_DIR="${RUNNER_TEMP}/sail-riscv" \
+            orchestration/generate-provider.sh \
+              "${RUNNER_TEMP}/provider" \
+              "${RUNNER_TEMP}/z3-memo/memo.db"
+
+          # Select an explicitly supported layout from the regenerated provider.
+          # Keep released and previously published toolchains available for attestation.
+          lean_toolchain="$(cat "${RUNNER_TEMP}/provider/Lean_RV32D/lean-toolchain")"
+          case "$lean_toolchain" in
+            leanprover/lean4:v4.26.0)
+              sail_runtime=lean-sail-v4.26
+              ;;
+            leanprover/lean4:v4.34.0-rc2|leanprover/lean4:v4.34.0)
+              sail_runtime=lean-sail
+              ;;
+            *)
+              echo "Unsupported generated Lean toolchain: $lean_toolchain" >&2
+              exit 1
+              ;;
+          esac
+          for provider in candidate/Lean_RV32D "${RUNNER_TEMP}/provider/Lean_RV32D"; do
+            test "$(cat "$provider/lean-toolchain")" = "$lean_toolchain"
+            test "$(cat "$provider/$sail_runtime/lean-toolchain")" = "$lean_toolchain"
+            grep -Fqx $'lean_toolchain\t'"$lean_toolchain" \
+              "$provider/sail-source-provenance.tsv"
+          done
+          diff --recursive --no-dereference --brief \
+            candidate/Lean_RV32D "${RUNNER_TEMP}/provider/Lean_RV32D"
+          echo "PROVIDER_ATTESTATION=pass"
+
+      - name: Record successful attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${CANDIDATE_SHA}" \
+            -f state=success \
+            -f context=attest \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f description='Provider regeneration matches'
+
+      - name: Record failed attestation
+        if: ${{ failure() && steps.candidate.outputs.sha != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${CANDIDATE_SHA}" \
+            -f state=failure \
+            -f context=attest \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f description='Provider regeneration failed'

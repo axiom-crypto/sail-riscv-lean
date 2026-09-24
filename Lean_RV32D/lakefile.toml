@@ -1,0 +1,15 @@
+name = "Lean_RV32D"
+defaultTargets = ["LeanRV32D"]
+license = "BSD-2-Clause"
+licenseFiles = ["LICENSE"]
+moreLeanArgs = ["--tstack=400000"]
+
+[[lean_lib]]
+name = "LeanRV32D"
+globs = ["LeanRV32D", "LeanRV32D.+"]
+leanOptions.weak.linter.style.nameCheck = false
+moreLeancArgs= ["-fbracket-depth=500"]
+
+[[require]]
+name = "Sail"
+path = "lean-sail"

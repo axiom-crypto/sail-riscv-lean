@@ -1,0 +1,8 @@
+name = "Sail"
+defaultTargets = ["Sail"]
+license = "BSD-2-Clause AND Apache-2.0"
+licenseFiles = ["../LICENSE"]
+
+[[lean_lib]]
+name = "Sail"
+leanOptions.weak.linter.style.nameCheck = false

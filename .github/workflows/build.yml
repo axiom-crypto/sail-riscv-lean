@@ -1,0 +1,44 @@
+name: Build Lean provider
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-provider-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out provider
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check Lean toolchain pins
+        working-directory: Lean_RV32D
+        run: |
+          test "$(cat lean-toolchain)" = 'leanprover/lean4:v4.34.0'
+          test "$(cat lean-sail/lean-toolchain)" = 'leanprover/lean4:v4.34.0'
+          grep -Fqx $'lean_toolchain\tleanprover/lean4:v4.34.0' \
+            sail-source-provenance.tsv
+
+      - name: Check the package licence matches the repository licence
+        run: cmp LICENSE Lean_RV32D/LICENSE
+
+      - name: Build Sail runtime and generated model
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: Lean_RV32D
+          auto-config: false
+          build: true
+          build-args: Sail LeanRV32D
+          use-mathlib-cache: false
