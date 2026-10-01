@@ -773,7 +773,7 @@ n).toNat
 def execute_hint_words (addr : (BitVec 32)) (n : Int) : SailM ExecutionResult := do
   let base := (BitVec.toNatInt addr)
   let end_addr := (base +i (4 *i n))
-  if (((n <b 0) || (openvm_hint_word_limit ≤b n)) : Bool)
+  if (((n ≤b 0) || (openvm_hint_word_limit ≤b n)) : Bool)
   then (pure (Illegal_Instruction ()))
   else
     (do
